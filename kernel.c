@@ -1,8 +1,47 @@
 #include "kernel.h"
 #include "common.h"
 
+extern char __kernel_base[];
+extern char __stack_top[];
+extern char __bss[], __bss_end[];
+extern char __free_ram[], __free_ram_end[];
+extern char _binary_shell_bin_start[], _binary_shell_bin_size[];
 
-extern char __bss[], __bss_end[], __stack_top[];
+struct process procs[PROCS_MAX]; // All process control structures.
+struct process *current_proc; // Currently running process
+struct process *idle_proc;    // Idle process
+
+paddr_t alloc_pages(uint32_t n) {
+    static paddr_t next_paddr = (paddr_t) __free_ram;
+    paddr_t paddr = next_paddr;
+    next_paddr += n * PAGE_SIZE;
+
+    if (next_paddr > (paddr_t) __free_ram_end)
+        PANIC("out of memory");
+
+    memset((void *) paddr, 0, n * PAGE_SIZE);
+    return paddr;
+}
+
+void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
+    if (!is_aligned(vaddr, PAGE_SIZE))
+        PANIC("unaligned vaddr %x", vaddr);
+
+    if (!is_aligned(paddr, PAGE_SIZE))
+        PANIC("unaligned paddr %x", paddr);
+
+    uint32_t vpn1 = (vaddr >> 22) & 0x3ff;
+    if ((table1[vpn1] & PAGE_V) == 0) {
+        // Create the non-existent 2nd level page table.
+        uint32_t pt_paddr = alloc_pages(1);
+        table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
+    }
+
+    // Set the 2nd level page table entry to map the physical page.
+    uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
+    uint32_t *table0 = (uint32_t *) ((table1[vpn1] >> 10) * PAGE_SIZE);
+    table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
+}
 
 struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
                        long arg5, long fid, long eid) {
@@ -111,6 +150,19 @@ void kernel_entry(void) {
     );
 }
 
+// ↓ __attribute__((naked)) is very important!
+__attribute__((naked)) void user_entry(void) {
+    __asm__ __volatile__(
+        "csrw sepc, %[sepc]        \n"
+        "csrw sstatus, %[sstatus]  \n"
+        "sret                      \n"
+        :
+        : [sepc] "r" (USER_BASE),
+          [sstatus] "r" (SSTATUS_SPIE)
+    );
+}
+
+
 void handle_trap(struct trap_frame *f) {
     uint32_t scause = READ_CSR(scause);
     uint32_t stval = READ_CSR(stval);
@@ -122,94 +174,6 @@ void handle_trap(struct trap_frame *f) {
 void putchar(char ch) {
     sbi_call(ch, 0, 0, 0, 0, 0, 0, 1 /* Console Putchar */);
 }
-
-extern char __free_ram[], __free_ram_end[];
-
-paddr_t alloc_pages(uint32_t n) {
-    static paddr_t next_paddr = (paddr_t) __free_ram;
-    paddr_t paddr = next_paddr;
-    next_paddr += n * PAGE_SIZE;
-
-    if (next_paddr > (paddr_t) __free_ram_end)
-        PANIC("out of memory");
-
-    memset((void *) paddr, 0, n * PAGE_SIZE);
-    return paddr;
-}
-
-void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
-    if (!is_aligned(vaddr, PAGE_SIZE))
-        PANIC("unaligned vaddr %x", vaddr);
-
-    if (!is_aligned(paddr, PAGE_SIZE))
-        PANIC("unaligned paddr %x", paddr);
-
-    uint32_t vpn1 = (vaddr >> 22) & 0x3ff;
-    if ((table1[vpn1] & PAGE_V) == 0) {
-        // Create the non-existent 2nd level page table.
-        uint32_t pt_paddr = alloc_pages(1);
-        table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
-    }
-
-    // Set the 2nd level page table entry to map the physical page.
-    uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
-    uint32_t *table0 = (uint32_t *) ((table1[vpn1] >> 10) * PAGE_SIZE);
-    table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
-}
-
-#define PROCS_MAX 8       // Maximum number of processes
-
-#define PROC_UNUSED   0   // Unused process control structure
-#define PROC_RUNNABLE 1   // Runnable process
-
-struct process procs[PROCS_MAX]; // All process control structures.
-extern char __kernel_base[];
-
-struct process *create_process(uint32_t pc) {
-    // Find an unused process control structure.
-    struct process *proc = NULL;
-    int i;
-    for (i = 0; i < PROCS_MAX; i++) {
-        if (procs[i].state == PROC_UNUSED) {
-            proc = &procs[i];
-            break;
-        }
-    }
-
-    if (!proc)
-        PANIC("no free process slots");
-
-    // Stack callee-saved registers. These register values will be restored in
-    // the first context switch in switch_context.
-    uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)];
-    *--sp = 0;                      // s11
-    *--sp = 0;                      // s10
-    *--sp = 0;                      // s9
-    *--sp = 0;                      // s8
-    *--sp = 0;                      // s7
-    *--sp = 0;                      // s6
-    *--sp = 0;                      // s5
-    *--sp = 0;                      // s4
-    *--sp = 0;                      // s3
-    *--sp = 0;                      // s2
-    *--sp = 0;                      // s1
-    *--sp = 0;                      // s0
-    *--sp = (uint32_t) pc;          // ra
-
-     // Map kernel pages.
-    uint32_t *page_table = (uint32_t *) alloc_pages(1);
-    for (paddr_t paddr = (paddr_t) __kernel_base;
-         paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
-        map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
-
-    // Initialize fields.
-    proc->pid = i + 1;
-    proc->state = PROC_RUNNABLE;
-    proc->sp = (uint32_t) sp;
-    proc->page_table = page_table;
-    return proc;
-}
-
 
 __attribute__((naked)) void switch_context(uint32_t *prev_sp,
                                            uint32_t *next_sp) {
@@ -254,17 +218,66 @@ __attribute__((naked)) void switch_context(uint32_t *prev_sp,
     );
 }
 
-void delay(void) {
-    for (int i = 0; i < 30000000; i++)
-        __asm__ __volatile__("nop"); // do nothing
+struct process *create_process(const void *image, size_t image_size) {
+    // Find an unused process control structure.
+    struct process *proc = NULL;
+    int i;
+    for (i = 0; i < PROCS_MAX; i++) {
+        if (procs[i].state == PROC_UNUSED) {
+            proc = &procs[i];
+            break;
+        }
+    }
+
+    if (!proc)
+        PANIC("no free process slots");
+
+    // Stack callee-saved registers. These register values will be restored in
+    // the first context switch in switch_context.
+    uint32_t *sp = (uint32_t *) &proc->stack[sizeof(proc->stack)];
+    *--sp = 0;                      // s11
+    *--sp = 0;                      // s10
+    *--sp = 0;                      // s9
+    *--sp = 0;                      // s8
+    *--sp = 0;                      // s7
+    *--sp = 0;                      // s6
+    *--sp = 0;                      // s5
+    *--sp = 0;                      // s4
+    *--sp = 0;                      // s3
+    *--sp = 0;                      // s2
+    *--sp = 0;                      // s1
+    *--sp = 0;                      // s0
+    *--sp = (uint32_t) user_entry;          // ra
+
+     // Map kernel pages.
+    uint32_t *page_table = (uint32_t *) alloc_pages(1);
+
+    for (paddr_t paddr = (paddr_t) __kernel_base;
+         paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
+        map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+
+     // Map user pages.
+    for (uint32_t off = 0; off < image_size; off += PAGE_SIZE) {
+        paddr_t page = alloc_pages(1);
+
+        // Handle the case where the data to be copied is smaller than the
+        // page size.
+        size_t remaining = image_size - off;
+        size_t copy_size = PAGE_SIZE <= remaining ? PAGE_SIZE : remaining;
+
+        // Fill and map the page.
+        memcpy((void *) page, image + off, copy_size);
+        map_page(page_table, USER_BASE + off, page,
+                 PAGE_U | PAGE_R | PAGE_W | PAGE_X);
+    }
+
+    // Initialize fields.
+    proc->pid = i + 1;
+    proc->state = PROC_RUNNABLE;
+    proc->sp = (uint32_t) sp;
+    proc->page_table = page_table;
+    return proc;
 }
-
-struct process *proc_a;
-struct process *proc_b;
-
-
-struct process *current_proc; // Currently running process
-struct process *idle_proc;    // Idle process
 
 void yield(void) {
     // Search for a runnable process
@@ -281,6 +294,10 @@ void yield(void) {
     if (next == current_proc)
         return;
 
+      // Context switch
+    struct process *prev = current_proc;
+    current_proc = next;
+
      __asm__ __volatile__(
         "sfence.vma\n"
         "csrw satp, %[satp]\n"
@@ -292,11 +309,18 @@ void yield(void) {
           [sscratch] "r" ((uint32_t) &next->stack[sizeof(next->stack)])
     );
 
-    // Context switch
-    struct process *prev = current_proc;
-    current_proc = next;
     switch_context(&prev->sp, &next->sp);
 }
+
+
+void delay(void) {
+    for (int i = 0; i < 30000000; i++)
+        __asm__ __volatile__("nop"); // do nothing
+}
+
+struct process *proc_a;
+struct process *proc_b;
+
 
 void proc_a_entry(void) {
     printf("starting process A\n");
@@ -321,12 +345,11 @@ void kernel_main(void) {
 
     WRITE_CSR(stvec, (uint32_t) kernel_entry);
 
-    // idle_proc = create_process((uint32_t) NULL);
-    // idle_proc->pid = -1; // idle
-    // current_proc = idle_proc; 
+    idle_proc = create_process(NULL, 0);
+    idle_proc->pid = -1; // idle
+    current_proc = idle_proc; 
 
-    // proc_a = create_process((uint32_t) proc_a_entry);
-    // proc_b = create_process((uint32_t) proc_b_entry);
+    create_process(_binary_shell_bin_start, (size_t) _binary_shell_bin_size);
 
     yield();
     PANIC("switched to idle process");
