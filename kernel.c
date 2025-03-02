@@ -62,6 +62,16 @@ struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
     return (struct sbiret){.error = a0, .value = a1};
 }
 
+void putchar(char ch) {
+    sbi_call(ch, 0, 0, 0, 0, 0, 0, 1 /* Console Putchar */);
+}
+
+long getchar(void) {
+    struct sbiret ret = sbi_call(0, 0, 0, 0, 0, 0, 0, 2);
+    return ret.error;
+}
+
+
 __attribute__((naked))
 __attribute__((aligned(4)))
 void kernel_entry(void) {
@@ -103,10 +113,6 @@ void kernel_entry(void) {
 
         "csrr a0, sscratch\n"
         "sw a0, 4 * 30(sp)\n"
-
-         // Retrieve and save the sp at the time of exception.
-        "csrr a0, sscratch\n"
-        "sw a0,  4 * 30(sp)\n"
 
         // Reset the kernel stack.
         "addi a0, sp, 4 * 31\n"
@@ -162,23 +168,10 @@ __attribute__((naked)) void user_entry(void) {
     );
 }
 
-
-void handle_trap(struct trap_frame *f) {
-    uint32_t scause = READ_CSR(scause);
-    uint32_t stval = READ_CSR(stval);
-    uint32_t user_pc = READ_CSR(sepc);
-
-    PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, user_pc);
-}
-
-void putchar(char ch) {
-    sbi_call(ch, 0, 0, 0, 0, 0, 0, 1 /* Console Putchar */);
-}
-
 __attribute__((naked)) void switch_context(uint32_t *prev_sp,
-                                           uint32_t *next_sp) {
+    uint32_t *next_sp) {
     __asm__ __volatile__(
-        
+
         // Save callee-saved registers onto the current process's stack.
         "addi sp, sp, -13 * 4\n" // Allocate stack space for 13 4-byte registers
         "sw ra,  0  * 4(sp)\n"   // Save callee-saved registers only
@@ -313,30 +306,47 @@ void yield(void) {
 }
 
 
-void delay(void) {
-    for (int i = 0; i < 30000000; i++)
-        __asm__ __volatile__("nop"); // do nothing
-}
+void handle_syscall(struct trap_frame *f) {
+    switch (f->a3) {
+        case SYS_PUTCHAR:
+            putchar(f->a0);
+            break;
+        case SYS_GETCHAR:
+            while (1) {
+                long ch = getchar();
+                if (ch >= 0) {
+                    f->a0 = ch;
+                    break;
+                }
 
-struct process *proc_a;
-struct process *proc_b;
-
-
-void proc_a_entry(void) {
-    printf("starting process A\n");
-    while (1) {
-        putchar('A');
-        yield();
+                yield();
+            }
+            break;
+        case SYS_EXIT:
+            printf("process %d exited\n", current_proc->pid);
+            current_proc->state = PROC_EXITED;
+            yield();
+            PANIC("unreachable");
+        default:
+            PANIC("unexpected syscall a3=%x\n", f->a3);
     }
 }
 
-void proc_b_entry(void) {
-    printf("starting process B\n");
-    while (1) {
-        putchar('B');
-        yield();
+
+void handle_trap(struct trap_frame *f) {
+    uint32_t scause = READ_CSR(scause);
+    uint32_t stval = READ_CSR(stval);
+    uint32_t user_pc = READ_CSR(sepc);
+    if (scause == SCAUSE_ECALL) {
+        handle_syscall(f);
+        user_pc += 4;
+    } else {
+        PANIC("unexpected trap scause=%x, stval=%x, sepc=%x\n", scause, stval, user_pc);
     }
+
+    WRITE_CSR(sepc, user_pc);
 }
+
 
 void kernel_main(void) {
     memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
@@ -346,7 +356,7 @@ void kernel_main(void) {
     WRITE_CSR(stvec, (uint32_t) kernel_entry);
 
     idle_proc = create_process(NULL, 0);
-    idle_proc->pid = -1; // idle
+    idle_proc->pid = 0; // idle
     current_proc = idle_proc; 
 
     create_process(_binary_shell_bin_start, (size_t) _binary_shell_bin_size);
