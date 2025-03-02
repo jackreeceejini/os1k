@@ -8,6 +8,7 @@
 // The base virtual address of an application image. This needs to match the
 // starting address defined in `user.ld`.
 #define SSTATUS_SPIE (1 << 5)
+#define SSTATUS_SUM  (1 << 18)
 #define SATP_SV32 (1u << 31)
 #define SCAUSE_ECALL 8 
 #define PROC_EXITED   2
@@ -17,6 +18,8 @@
 #define PAGE_X    (1 << 3)   // Executable
 #define PAGE_U    (1 << 4)   // User (accessible in user mode)
 #define USER_BASE 0x1000000
+#define FILES_MAX      2
+#define DISK_MAX_SIZE  align_up(sizeof(struct file) * FILES_MAX, SECTOR_SIZE)
 #define SECTOR_SIZE       512
 #define VIRTQ_ENTRY_NUM   16
 #define VIRTIO_DEVICE_BLK 2
@@ -136,6 +139,36 @@ struct trap_frame {
     uint32_t s11;
     uint32_t sp;
 } __attribute__((packed));
+
+struct tar_header {
+    char name[100];
+    char mode[8];
+    char uid[8];
+    char gid[8];
+    char size[12];
+    char mtime[12];
+    char checksum[8];
+    char type;
+    char linkname[100];
+    char magic[6];
+    char version[2];
+    char uname[32];
+    char gname[32];
+    char devmajor[8];
+    char devminor[8];
+    char prefix[155];
+    char padding[12];
+    char data[];      // Array pointing to the data area following the header
+                      // (flexible array member)
+} __attribute__((packed));
+
+struct file {
+    bool in_use;      // Indicates if this file entry is in use
+    char name[100];   // File name
+    char data[1024];  // File content
+    size_t size;      // File size
+};
+
 
 #define READ_CSR(reg)                                                          \
     ({                                                                         \
